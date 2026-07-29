@@ -1,0 +1,38 @@
+name: 星穹鐵道香港聯動消息監控
+
+on:
+  schedule:
+    # 每天 00:13 UTC = 08:13 香港時間(避開整點,降低排隊延遲)
+    - cron: "13 0 * * *"
+  workflow_dispatch: {}  # 允許手動觸發測試
+
+permissions:
+  contents: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run monitor
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: python honkai_hk_alert.py
+
+      - name: Commit updated sent_ids.json
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add sent_ids.json
+          git diff --staged --quiet || git commit -m "更新已推送清單 [skip ci]"
+          git push
