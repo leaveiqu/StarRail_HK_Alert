@@ -2,11 +2,13 @@
 """
 星穹鐵道 香港聯動消息 自動監控腳本
 資料源:
-  1. HoYoverse 國際服 啟動器資訊 API (data.post)
-  2. 米哈遊 國服 啟動器資訊 API (data.post)  -> 代表米游社官方資訊
-  3. Facebook 崩壞：星穹鐵道 繁中官方專頁 (透過 RSSHub 轉 RSS)
+  1. HoYoLAB 官方星穹鐵道公告 RSS (feeds.c3kay.de,每30分鐘更新,實測可用)
+  2. Facebook 崩壞：星穹鐵道 繁中官方專頁 (透過 RSSHub 轉 RSS,best-effort,公開節點可能被限流)
 
-流程:抓取 -> 關鍵字比對 -> 與 sent_ids.json 去重 -> 推送 Discord -> 更新 sent_ids.json
+注意:米哈遊啟動器 content API (getAllGameBasicInfo) 需要未公開的啟動器 key,
+     無法在沒有金鑰的情況下取得資料,故不採用此路線。
+
+流程:抓取 -> 關鍵字比對(必須同時命中「香港」+「聯動類詞」) -> 與 sent_ids.json 去重 -> 推送 Discord -> 更新 sent_ids.json
 """
 
 import json
@@ -33,21 +35,17 @@ COLLAB_KEYWORDS = [
     "線下活動", "线下活动", "線下", "线下", "展覽", "展览",
     "主題店", "主题店", "期間限定", "期间限定", "pop-up", "POP-UP", "Pop-up",
     "cafe", "咖啡店", "咖啡廳", "咖啡厅", "商店", "特別店",
+    # 英文版(HoYoLAB 官方公告以英文為主)
+    "offline event", "Offline Event", "collab", "Collab", "collaboration",
+    "Collaboration", "pop-up store", "meetup", "meet-up", "exhibition",
+    "Exhibition", "fan meet", "HoYo FEST", "themed store", "merchandise store",
 ]
 
 SENT_IDS_FILE = Path(__file__).parent / "sent_ids.json"
 MAX_KEEP_IDS = 800  # 避免檔案無限成長,只保留最近 N 筆
 
-SOURCES_LAUNCHER = [
-    {
-        "name": "HoYoLAB(國際服官方資訊)",
-        "url": "https://hkrpg-launcher-static.hoyoverse.com/hkrpg_global/mdk/launcher/api/content?language=zh-tw&launcher_id=35",
-    },
-    {
-        "name": "米游社(國服官方資訊)",
-        "url": "https://api-launcher.mihoyo.com/hkrpg_cn/mdk/launcher/api/content?language=zh-cn&launcher_id=33",
-    },
-]
+# HoYoLAB 官方星穹鐵道公告 RSS(第三方長期維護、每30分鐘更新一次,實測可用)
+HOYOLAB_FEED_URL = "https://feeds.c3kay.de/starrail.xml"
 
 # RSSHub 公開節點,如果失效可換成自架節點或其他公開節點
 RSSHUB_BASE = os.environ.get("RSSHUB_BASE", "https://rsshub.app")
@@ -81,11 +79,17 @@ def save_sent_ids(ids: set):
     )
 
 
+REGION_PATTERN = re.compile(r"(香港|\bHK\b|\bHong\s+Kong\b)", re.IGNORECASE)
+
+
 def is_hit(text: str) -> bool:
+    """必須同時符合:(1) 明確提到香港 (2) 出現聯動/線下活動類詞彙,兩者缺一不可。
+    這樣可以避免新加坡、馬來西亞、菲律賓等其他地區的活動被誤判為香港消息。"""
     if not text:
         return False
-    has_region = any(k in text for k in REGION_KEYWORDS)
-    has_collab = any(k.lower() in text.lower() for k in COLLAB_KEYWORDS)
+    has_region = bool(REGION_PATTERN.search(text))
+    text_lower = text.lower()
+    has_collab = any(k.lower() in text_lower for k in COLLAB_KEYWORDS)
     return has_region and has_collab
 
 
@@ -104,29 +108,23 @@ def trim_summary(text: str, length: int = 100) -> str:
 # 各資料源抓取
 # ---------------------------------------------------------------------------
 
-def fetch_launcher_source(source: dict) -> list:
-    """抓取米哈遊啟動器 content API 的 post 區塊"""
+def fetch_hoyolab_official_feed() -> list:
+    """抓取 HoYoLAB 官方星穹鐵道公告 RSS(主力來源,穩定可用)"""
     items = []
     try:
-        resp = requests.get(source["url"], timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+        resp = requests.get(HOYOLAB_FEED_URL, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
         resp.raise_for_status()
-        data = resp.json()
-        posts = data.get("data", {}).get("post", []) or []
-        for p in posts:
-            title = p.get("title") or p.get("tittle") or ""
-            link = p.get("url") or ""
-            show_time = p.get("show_time", "")
-            if not link:
-                continue
+        feed = feedparser.parse(resp.content)
+        for entry in feed.entries:
             items.append({
-                "title": title,
-                "summary": "",  # 啟動器 API 不提供內文,摘要留空由 trim_summary 補預設字串
-                "link": link,
-                "source": source["name"],
-                "pub_date": show_time,
+                "title": entry.get("title", ""),
+                "summary": entry.get("summary", ""),
+                "link": entry.get("link", ""),
+                "source": "HoYoLAB(官方星穹鐵道公告)",
+                "pub_date": entry.get("published", ""),
             })
     except Exception as e:
-        print(f"[警告] 抓取 {source['name']} 失敗: {e}", file=sys.stderr)
+        print(f"[警告] 抓取 HoYoLAB 官方 RSS 失敗: {e}", file=sys.stderr)
     return items
 
 
@@ -153,9 +151,8 @@ def fetch_facebook_rss() -> list:
 
 def fetch_all() -> list:
     all_items = []
-    for src in SOURCES_LAUNCHER:
-        all_items.extend(fetch_launcher_source(src))
-    all_items.extend(fetch_facebook_rss())
+    all_items.extend(fetch_hoyolab_official_feed())  # 主力來源,穩定
+    all_items.extend(fetch_facebook_rss())  # 輔助來源,best-effort
     return all_items
 
 
